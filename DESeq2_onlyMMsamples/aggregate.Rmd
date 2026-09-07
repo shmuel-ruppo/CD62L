@@ -1,0 +1,83 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+
+```{r}
+RES_SAVE <- T
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SingleCellExperiment)
+  library(mclust)
+  library(dplyr)
+  library(Matrix)
+  library(ggplot2)
+  library(SingleR)
+  library(celldex)
+  library(TLMoments)
+  library(sctransform)
+  library(glue)
+  library(glmGamPoi)
+  library(SeuratDisk)
+  library(patchwork)
+  library(dplyr)
+  library(tidyr)
+  library(SeuratData)
+  library(scDblFinder)
+  library(BiocGenerics)
+  library(qs)
+
+})
+
+
+
+options(future.globals.maxSize = 20000 * 1024^2)
+
+
+
+title_theme <- theme(plot.title = element_text(size = 16, hjust = 0.5, face="bold", color="magenta"))
+
+toPrc <- function(x) (x * 100) %>% round(1) 
+
+```
+
+
+
+```{r Read object}
+sObj_integAll_CARplus <- qread("../Robjects/sObj_integratedAll_CARplus.qs")
+```
+
+
+```{r}
+
+# Use multiple myeloma (MM) patients for comparison, NOT the healthy person (PHE011)
+
+aggr_by_CAR <- sObj_integAll_CARplus %>% subset(health == "MM") %>% AggregateExpression(
+    group.by = c("orig.ident"),
+  assay = "RNA",      
+  return.seurat = FALSE, 
+  ) %>% as.data.frame()
+  
+  colnames(aggr_by_CAR) <- colnames(aggr_by_CAR) %>%  sub(x=., "RNA", "") %>%  sub(x=., ".", "", fixed=T) %>% gsub(x=., ".", "_", fixed=T)
+  
+
+```
+
+
+
+```{r}
+
+aggr_by_CAR %>% arrange(rownames(.)) %>%head()
+```
+
+```{r}
+
+if(RES_SAVE)
+  aggr_by_CAR %>%  write.table("counts_by_origident_wCAR.tsv", sep="\t", col.names=NA, quote=F)
+
+```
+

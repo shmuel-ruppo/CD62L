@@ -1,0 +1,239 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Setup
+
+
+
+```{r}
+
+# Raw data (CellRanger output) is available at https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE333279
+
+MATRIX_DIRECTORIES <- c(MM2_CD62L = "../../counts_from_cluster/BCMA137_CD62L/outs/filtered_feature_bc_matrix/", MM2_TM = "../../counts_from_cluster/BCMA137_TM/outs/filtered_feature_bc_matrix/", MM1_CD62L = "../../counts_from_cluster/BCMA120_CD62L/outs/filtered_feature_bc_matrix/",MM1_TM= "../../counts_from_cluster/BCMA120_TM/outs/filtered_feature_bc_matrix/", HD_CD62L = "../../counts_from_cluster/PHE011_CD62L//outs/filtered_feature_bc_matrix/", HD_TM="../../counts_from_cluster/PHE011_TM/outs/filtered_feature_bc_matrix/")
+
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SingleCellExperiment)
+  library(mclust)
+  library(dplyr)
+  library(Matrix)
+  library(ggplot2)
+  library(SingleR)
+  library(celldex)
+  library(TLMoments)
+  library(sctransform)
+  library(glue)
+  library(glmGamPoi)
+  library(SeuratDisk)
+  library(patchwork)
+  library(dplyr)
+  library(tidyr)
+  library(SeuratData)
+  library(scDblFinder)
+  library(BiocGenerics)
+
+})
+
+options(future.globals.maxSize = 20000 * 1024^2)
+
+
+title_theme <- theme(plot.title = element_text(size = 16, hjust = 0.5, face="bold", color="magenta"))
+
+```
+
+# Create  seurat objectss
+
+```{r }
+sObj <- MATRIX_DIRECTORIES %>% names() %>% lapply(function(i) {
+  
+  print(paste("", i))
+  
+  barcode.path <- MATRIX_DIRECTORIES[[i]] %>% paste0("/barcodes.tsv.gz")
+  features.path <- MATRIX_DIRECTORIES[[i]] %>% paste0("/features.tsv.gz")
+  matrix.path <- MATRIX_DIRECTORIES[[i]] %>% paste0("/matrix.mtx.gz")
+  feature.names = read.delim(features.path, 
+                             header = FALSE,
+                             stringsAsFactors = FALSE) %>% setNames(c("ENSEMBL", "SYMBOL", "REMOVEME")) %>% select(-REMOVEME)
+  barcode.names = read.delim(barcode.path, 
+                             header = FALSE,
+                             stringsAsFactors = FALSE)
+  
+    mat <- readMM(file = matrix.path)
+
+  colnames(mat) = barcode.names$V1
+  
+  
+  dupl_feature_names <- duplicated(feature.names$SYMBOL) | duplicated(feature.names$SYMBOL, fromLast=T)
+  
+  feature.names[dupl_feature_names,] <- paste0(feature.names[dupl_feature_names, "ENSEMBL"], "-", feature.names[dupl_feature_names, "SYMBOL"])
+  
+  rownames(mat) = feature.names$SYMBOL
+
+  min_genes <- 200
+  min_cells <-3
+  internal_sobj <- Seurat::CreateSeuratObject(counts = mat, min.cells = min_cells, min.features = min_genes, project = "CARproj")
+  
+  
+
+  # internal_sobj[["RNA3"]] <- as(object = internal_sobj[["RNA"]], Class = "Assay") # does not work, use the following as recommended at https://github.com/satijalab/seurat-object/issues/206 :
+  
+  assay_v3 <- CreateAssayObject(
+  counts = internal_sobj[["RNA"]]$counts
+)
+
+internal_sobj[["RNA3"]] <- assay_v3
+
+  paste0("Began analysis with ", length(barcode.names$V1), " cells and ", length(feature.names$SYMBOL), " genes") %>% print()
+  paste0("\nAfter filtering cells with less than ", ceiling(min_genes), " genes,",
+                  "\nand genes with less than ", ceiling(min_cells), " cells:") %>% print()
+paste0("Working on ", length(internal_sobj@assays$RNA3@data@Dimnames[[2]]), " cells and ", length(internal_sobj@assays$RNA3@data@Dimnames[[1]]), " genes") %>% print()
+
+#  add the experiment name to the meta data
+  exp.info <- data.frame(nexp = sample(x = c(i), size = length(x = row.names(internal_sobj@meta.data)),
+  replace = TRUE), row.names = row.names(internal_sobj@meta.data))
+  internal_sobj <- AddMetaData(internal_sobj, exp.info, "exp_name")
+  
+  mito.genes_CARproj <- grep("MT-", rownames(internal_sobj@assays$RNA3@data), value = T)
+  
+  # Mitochondria genes divided by total genes
+  
+  percent.mito_CARproj <- colSums(as.matrix(internal_sobj@assays$RNA3@data[mito.genes_CARproj, ]))/colSums(as.matrix(internal_sobj@assays$RNA3@data))
+  
+  internal_sobj <- AddMetaData(internal_sobj, percent.mito_CARproj, "percent.mito")
+  nUMI_CARproj <- internal_sobj@meta.data$nCount_RNA
+  nGene_CARproj <- internal_sobj@meta.data$nFeature_RNA
+  internal_sobj <- AddMetaData(internal_sobj, nUMI_CARproj, "nUMI")
+  internal_sobj <- AddMetaData(internal_sobj, nGene_CARproj, "nGene")
+  
+  return(internal_sobj)
+  
+}) %>% setNames( MATRIX_DIRECTORIES %>% names() )
+```
+
+
+
+
+## Plot QC plots before filtering
+```{r}
+
+
+ sObj %>% names() %>% lapply(function(i) {
+
+   internal_sobj <- sObj[[i]]
+   
+  (VlnPlot(object=internal_sobj, features = c("nGene","nUMI", "percent.mito")) + plot_annotation(paste0("Before filtering: ", i), theme=title_theme)) %>% print()
+   
+ })
+```
+
+```{r}
+# sObj %>% saveRDS("Robjects/sObj_unfiltered.RDS")
+```
+
+
+
+```{r}
+
+
+sObj <- sObj %>% names() %>% lapply(function(i) {
+# Here we subsetted only on the basis of mitochondria. 
+  
+  print(i)
+  
+  internal_sobj <- sObj[[i]]
+  
+  internal_sobj <- subset(x=internal_sobj, subset = percent.mito < 0.05 & nGene > 2000 )
+  paste0("\nAfter filtering for cells with less than 0.05 percent mito and nGene > 2000") %>% print()
+  
+  paste0("Working on ", length(internal_sobj@assays$RNA3@data@Dimnames[[2]]), " cells and ", length(internal_sobj@assays$RNA3@data@Dimnames[[1]]), " genes") %>% print()
+
+  attr(internal_sobj, "myname") <- i
+  
+  return(internal_sobj)
+}) %>% setNames(sObj %>% names() )
+```
+
+
+
+
+```{r }
+sObj %>% lapply(function(internal_sobj) {
+  
+  internal_sobj %>% VlnPlot(features = c("nGene","nUMI", "percent.mito")) + ggtitle(attr(internal_sobj, "myname"))
+  
+  
+})
+```
+
+
+
+```{r }
+sObj <- sObj %>% lapply( function(internal_sobj) {
+
+  print("Working on")
+  print( attr(internal_sobj, "myname")   ) 
+  
+  internal_sobj <- internal_sobj %>% SCTransform(vst.flavor = "v2", verbose = FALSE)
+  internal_sobj <- internal_sobj %>% RunPCA(verbose = FALSE)
+  internal_sobj <- internal_sobj %>% RunUMAP(dims = 1:50)
+  
+  internal_sobj <- internal_sobj %>% FindNeighbors()
+  internal_sobj <- internal_sobj %>% FindClusters(resolution=0.4)
+  
+  
+  internal_sobj
+})
+```
+
+
+
+```{r}
+reference_multimodal <- readRDS("../../counts/pbmc_multimodal_2023.rds")
+```
+
+```{r}
+sObj <- sObj %>% lapply( function(internal_sobj) {
+
+  print("Working on")
+  print( attr(internal_sobj, "myname")   ) 
+  
+    
+    
+  anchors <- FindTransferAnchors(
+    reference = reference_multimodal,
+    query = internal_sobj,
+    normalization.method = "SCT",
+    reference.reduction = "spca",
+    dims = 1:50
+  )
+
+  internal_sobj <- MapQuery(
+    anchorset = anchors,
+    query = internal_sobj,
+    reference = reference_multimodal,
+    refdata = list(
+        celltype.l1 = "celltype.l1",
+        celltype.l2 = "celltype.l2",
+        celltype.l3 = "celltype.l3"),
+    reference.reduction = "spca",
+    reduction.model = "wnn.umap"
+  )
+  internal_sobj 
+  })
+
+
+
+```
+
+
+## Save/read 
+
+```{r}
+library(qs)
+sObj %>% qsave("Robjects/sObj.qs")
+```
+
+

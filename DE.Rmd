@@ -1,0 +1,1036 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Setup
+
+
+```{r}
+library(dplyr)
+
+
+MARKERS_LIST <- c( "CD8 subset" = "geneSets/CD8",
+                      "T-cell Activation and Exhaustion"="geneSets/T_cell_Activation_and_Exhaustion",
+                    "T-cell Memory associated"="geneSets/T_cell_Memory_associated"
+                    )
+
+markersList_v6 <- MARKERS_LIST %>% lapply(readLines) %>% setNames(MARKERS_LIST %>% names())
+
+additionalMarkers <- "geneSets/MARKERS" %>% readLines()
+
+
+
+GENE_SETS <- 
+  
+  c("RAMALHO STEMNESS UP" =   "geneSets/RAMALHO_STEMNESS_UP", 
+"Cell proliferation"="geneSets/CELL_PROLIFERATION_GO_0008283_",
+"HALLMARK OXIDATIVE PHOSPHORYLATION" = "geneSets/HALLMARK_OXIDATIVE_PHOSPHORYLATION", 
+"HALLMARK FATTY ACID METABOLISM"="geneSets/HALLMARK_FATTY_ACID_METABOLISM",
+"HALLMARK GLYCOLYSIS" = "geneSets/HALLMARK_GLYCOLYSIS"
+)
+
+GENE_SETS <- c(GENE_SETS ,MARKERS_LIST)  # use all the markers lists for gene lists also 
+
+ 
+
+geneSets <- GENE_SETS %>% lapply(readLines) %>% setNames(GENE_SETS %>% names())
+
+
+
+VIOLIN_COLS = c("CD62L" = "#F8766D", "TM" = "#2596BE")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SingleCellExperiment)
+  library(mclust)
+  library(cowplot)
+  library(Matrix)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(ggplot2)
+  library(SingleR)
+  library(celldex)
+  library(TLMoments)
+  library(sctransform)
+  library(glue)
+  library(glmGamPoi)
+  library(SeuratDisk)
+  library(patchwork)
+  library(Polychrome)
+  library(grid)
+  library(tidyr)
+  library(SeuratData)
+  library(scDblFinder)
+  library(BiocGenerics)
+  library(qs)
+})
+
+
+
+
+# Helper functions
+
+# Change the rownames of a dataframe
+setRowNames <- function(df, rnames) {
+  rownames(df) <- rnames
+  df
+}
+
+
+
+
+# Display proportion tables in suitable visual format
+
+myPropTable <- function(dat) {
+  res_table <- table(dat) %>% prop.table() %>% {function(x) x*100}(.) %>% round(1)
+  res <- res_table %>% as.data.frame() %>% .$Freq
+  names(res) <- res_table %>% as.data.frame() %>% .[,1]
+  
+  res %>% as.data.frame() %>% setNames("freq")
+}  
+
+myPropTable_2var <- function(dat1, dat2, margin=1) {
+  res_table <- table(dat1, dat2) %>% prop.table(margin=margin) %>% {function(x) x*100}(.) %>% round(1)
+  res <- res_table %>% as.data.frame() %>% pivot_wider(names_from="dat2" , values_from =Freq ) %>% as.data.frame()
+  rownames(res) <- res$dat1
+  res <- res %>% select(-dat1)
+  res
+}  
+
+
+# theme for UMAP plots
+umap_theme = theme( title=element_text(size=42, face = "bold"), strip.text = element_text(size=36, face="bold"), legend.text=element_text(size=38, face="bold"))
+
+
+# Helper function, substitutes spacebars and slashes for underscores.
+make_file_name <- function(x) {
+  return (x %>% gsub(pattern=" ", replacement="_") %>% gsub(pattern="/",replacement="_")) }
+
+
+# Helper function : plot a graph and the legend separately
+# Sets a uniform size per all
+
+tiff_split <- function(ggObj, fname) {
+ # Plot the main file without the legend
+ tiff(fname, width=1.5*960, height=2*480, compression="lzw")
+  (ggObj + theme(legend.position =  "none")) %>% print()
+ dev.off()
+ 
+ # create another filename for the legend
+ fname_legend <- fname %>% sub(pattern=".tiff", replacement="", fixed=T) %>% paste0("_LEGEND.tiff")
+ 
+ # Plot the legend only
+ tiff(fname_legend, width=0.75*960, height=2*480, compression="lzw")
+   grid.newpage()
+   ggObj %>% cowplot::get_plot_component( "guide-box-right") %>% grid.draw() # get_legend() 
+ dev.off()
+  
+}
+
+
+```
+
+# Start from here
+
+```{r }
+sObj_integAll <- qread("Robjects/sObj_integratedAll.qs")
+
+
+
+
+
+DefaultAssay(sObj_integAll) <- "SCT"
+
+
+```
+
+```{r}
+
+
+
+sObj_integAll$Treatment <- sObj_integAll$exp_name %>% sapply(function(i) strsplit(i, split = "_", fixed=T)[[1]][2])
+
+
+
+
+# Get Donor 
+sObj_integAll$Donor <- sObj_integAll$exp_name %>% sapply(function(x) strsplit(x, split="_") %>% unlist() %>% .[1])
+
+
+sObj_integAll$orig.ident <-  sObj_integAll$exp_name %>% factor(levels=c( "MM1_CD62L" ,"MM1_TM" ,"MM2_CD62L" ,"MM2_TM" ,"HD_CD62L" , "HD_TM"))
+
+sObj_integAll$orig.ident.changeOrder <-sObj_integAll$orig.ident %>% factor(levels=c("MM1_CD62L", "MM2_CD62L", "HD_CD62L", "MM1_TM", "MM2_TM", "HD_TM"))
+
+
+```
+
+# Add CAR
+
+```{r}
+sink("larger_or_equal_to_median.txt")
+
+sObj_integAll@meta.data$CAR <- NA
+
+sObj_integAll$orig.ident %>% unique() %>% lapply(function(i) {
+
+  internal_sobj <- sObj_integAll %>% subset(subset=orig.ident==i)
+
+
+  DefaultAssay(internal_sobj) <- "SCT"
+
+  internal_idx <- colnames(internal_sobj)
+
+  median_CAR <-  internal_sobj@assays$SCT$data["CAR",] %>% median()
+
+
+  sObj_integAll@meta.data[internal_idx,"CAR"] <<- internal_sobj@assays$SCT$data["CAR",internal_idx]  >= median_CAR
+
+
+  print(paste0("\n\n\n================================", i, "=====================\n")) 
+  print(paste0("Only cells with at least ",  exp(median_CAR)," normalized expression of CAR will be retained"))
+
+  })
+
+sink()
+```
+
+```{r}
+
+
+
+## Seurat clusters
+
+set.seed(123)
+
+DefaultAssay(sObj_integAll) <- "integrated"
+sObj_integAll <- FindNeighbors(sObj_integAll, dims=1:50)
+sObj_integAll <- sObj_integAll %>% FindClusters(resolution=0.4)
+DefaultAssay(sObj_integAll) <- "SCT"
+```
+
+```{r}
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="seurat_clusters", label = T, label.size=10, repel=T) + ggtitle("Seurat clusters") + guides(colour=guide_legend(override.aes=list(size=18)))+ umap_theme ) %>% 
+  tiff_split(fname = "images_v19/DimPlot_All_groupByClusters.tiff")
+
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="seurat_clusters", split.by="orig.ident.changeOrder",label=T, label.size=10, repel=T) + ggtitle("Seurat clusters, split by original sample") + guides(colour=guide_legend(override.aes=list(size=18)))+ umap_theme   ) %>%
+tiff_split("images_v19/DimPlot_All_groupByClusters_splitByOrigIdent.tiff")
+
+
+
+
+```
+
+## Basic statistics
+
+```{r}
+sObj_integAll@assays$SCT$data %>% dim()
+
+sObj_integAll$orig.ident %>% table()
+
+sObj_integAll$orig.ident %>% table() %>% sum()
+
+```
+
+# Set CD4,CD8
+
+```{r Define CD4,CD8}
+
+
+  
+  
+  # Three criteria for CD8
+
+  sObj_integAll$CD8_expressed <- sObj_integAll[["SCT"]]@data["CD8A",] > 0 | sObj_integAll[["SCT"]]@data["CD8B",] > 0 |sObj_integAll[["SCT"]]@data["CD8B2",] > 0   
+
+  sObj_integAll$CD4_expressed <- sObj_integAll[["SCT"]]@data["CD4",] > 0 
+
+  
+  sObj_integAll$CD3_expressed <- sObj_integAll[["SCT"]]@data["CD3G",] > 0 | sObj_integAll[["SCT"]]@data["CD3D",] > 0 |sObj_integAll[["SCT"]]@data["CD3E",] > 0   
+
+   
+   ## Define a combined slot of CD4CD8, with 4 possible values
+
+  
+  sObj_integAll$CD4CD8 <- ifelse(sObj_integAll$CD8_expressed & sObj_integAll$CD4_expressed, "CD4CD8", ifelse(sObj_integAll$CD8_expressed & !sObj_integAll$CD4_expressed, "CD8", ifelse(sObj_integAll$CD4_expressed & !sObj_integAll$CD8_expressed, "CD4", "NoCD4CD8"))) 
+  
+
+```
+
+```{r}
+(table4 <- myPropTable_2var(sObj_integAll$predicted.celltype.l1, sObj_integAll$orig.ident, margin=2 ))
+table4 %>% write.table("images_v19/table4_predicted_level1_bySample.csv", col.names=NA, sep="\t", quote=F)
+
+# Note that the two levels do not really correspond to each other. But it is okay - probably they were were calculated independently.
+(table5 <- myPropTable_2var(sObj_integAll$predicted.celltype.l2, sObj_integAll$orig.ident, margin=2))
+table5 %>% write.table("images_v19/table5_predicted_level2_bySample.csv", col.names=NA, sep="\t", quote=F)
+
+# table6
+(table6 <- table(sObj_integAll$seurat_clusters))
+table6 %>% write.table("images_v19/table6_cellNumByCluster.txt", sep="\t", quote=F, row.names=F)
+
+# table 7
+(table7 <- myPropTable_2var(sObj_integAll$CD4CD8, sObj_integAll$seurat_clusters ,  margin=2))
+table7 %>% write.table("images_v19/table7_CD4CD8_byCluster.csv", col.names=NA, sep="\t", quote=F)
+
+(table8 <- myPropTable_2var(sObj_integAll$predicted.celltype.l1, sObj_integAll$seurat_clusters, margin=2))
+table8 %>% write.table("images_v19/table8_predicted_level1_byCluster.csv", col.names=NA, sep="\t", quote=F)
+
+
+
+
+```
+
+# Create plots on all data
+
+```{r}
+
+
+Idents(sObj_integAll) <- "orig.ident.changeOrder"
+   
+tiff("images_v19/VlnPlot_QC_v2.tiff", width=1.5*960, compression="lzw")
+VlnPlot(object=sObj_integAll, features = c("nGene","nUMI", "percent.mito"), split.by="orig.ident.changeOrder") 
+dev.off()
+   
+tiff("images_v19/VlnPlot_QC.tiff", width=1.5*960, compression="lzw")
+VlnPlot(object=sObj_integAll, features = c("nGene","nUMI", "percent.mito")) 
+dev.off()
+
+
+
+```
+
+```{r}
+
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="orig.ident.changeOrder") +ggtitle("Original sample")+ guides(colour=guide_legend(override.aes=list(size=18)))+ umap_theme ) %>% 
+tiff_split("images_v19/DimPlot_All_groupBy_Orig_ident.tiff")
+
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="Donor") + guides(colour=guide_legend(override.aes=list(size=18)))+ umap_theme ) %>%
+tiff_split("images_v19/DimPlot_All_groupBy_Donor.tiff")
+
+
+```
+
+
+```{r}
+
+sObj_integAll$CD4CD8_forVisualization <- sObj_integAll$CD4CD8 %>% factor(levels=c("CD4", "CD8", "CD4CD8", "NoCD4CD8"))
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="seurat_clusters", split.by="CD4CD8_forVisualization",label=T, label.size=10, repel=T) + ggtitle("Seurat clusters, split by CD4,CD8 markers") + guides(colour=guide_legend(override.aes=list(size=18)))+ umap_theme ) %>%
+tiff_split("images_v19/DimPlot_All_groupByClusters_splitByCD4CD8.tiff")
+
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="CD4CD8_forVisualization", split.by="orig.ident.changeOrder", cols=c("#4C78A8", "#F18B1F", "#AA70B3", "grey")) + ggtitle("CD4_CD8") + guides(colour=guide_legend(override.aes=list(size=18)))+  umap_theme ) %>% tiff_split("images_v19/DimPlot_All_groupByCD4_CD8_split.tiff")
+
+
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="seurat_clusters", split.by="CD4CD8",label=T, label.size=10, repel=T) + ggtitle("Seurat clusters, split by CD4,CD8 markers") + guides(colour=guide_legend(override.aes=list(size=18)))+ umap_theme ) %>%
+tiff_split("images_v19/DimPlot_All_groupByClusters_splitByCD4CD8.tiff")
+
+
+```
+
+```{r}
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="CD4CD8_forVisualization", cols=c("#4C78A8", "#F18B1F", "#AA70B3", "grey")) + ggtitle("CD4_CD8")  + guides(colour=guide_legend(override.aes=list(size=18)))+ umap_theme ) %>% tiff_split("images_v19/DimPlot_All_groupByCD4_CD8.tiff")
+
+```
+
+## Fetch the CD8 & CD4 percentages (and CAR alslo)
+
+```{r}
+
+
+
+dim(sObj_integAll@assays$SCT)
+
+table(sObj_integAll$orig.ident) 
+
+
+
+(table(sObj_integAll$orig.ident, sObj_integAll$CD3_expressed) %>% prop.table(margin = 1) %>% {function(x) x*100}(.)) %>% round(1)
+
+(table(sObj_integAll$orig.ident, sObj_integAll$CAR) %>% prop.table(margin = 1) %>% {function(x) x*100}(.)) %>% round(1)
+
+(table(sObj_integAll$orig.ident, sObj_integAll$CD4CD8) %>% prop.table(margin = 1) %>% {function(x) x*100}(.)) %>% round(1)
+
+
+(table(sObj_integAll$orig.ident, sObj_integAll$predicted.celltype.l1) %>% prop.table(margin = 1) %>% {function(x) x*100}(.)) %>% round(1)
+
+(table(sObj_integAll$orig.ident, sObj_integAll$predicted.celltype.l2) %>% prop.table(margin = 1) %>% {function(x) x*100}(.)) %>% round(1)
+
+
+```
+
+```{r}
+
+
+
+sObj_integAll$CAR_asPosNeg <- ifelse(sObj_integAll$CAR, "CAR +", "CAR -") %>% factor(levels=c("CAR -", "CAR +")) # First level CAR minus, second level CAR plus
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by = "CAR_asPosNeg", split.by="orig.ident.changeOrder", cols=c("grey", "cyan")) + ggtitle("CAR per sample")+ guides(colour=guide_legend(override.aes=list(size=18))) + umap_theme
+) %>% tiff_split("images_v19/DimPlot_All_splitByCARr.tiff")
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by = "CAR_asPosNeg",cols=c("lightgrey", "cyan"))  + ggtitle("CAR")+ guides(colour=guide_legend(override.aes=list(size=18)))+umap_theme 
+) %>% tiff_split("images_v19/DimPlot_All_groupByCARr.tiff")
+
+```
+
+```{r}
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="predicted.celltype.l1", split.by="orig.ident.changeOrder")  +guides(colour=guide_legend(override.aes=list(size=18))) + umap_theme ) %>% 
+tiff_split("images_v19/DimPlot_All_split_predicted.tiff")
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="predicted.celltype.l1") +guides(colour=guide_legend(override.aes=list(size=18))) + umap_theme) %>% 
+tiff_split("images_v19/DimPlot_All_predicted.tiff")
+
+
+
+sObj_integAll$health <- ifelse(sObj_integAll$Donor == "HD", "Healthy", "MM")
+sObj_integAll$Treatment__health <- paste0(sObj_integAll$Treatment, "_", sObj_integAll$health)
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="predicted.celltype.l1", split.by = "Treatment__health") +guides(colour=guide_legend(override.aes=list(size=18))) + umap_theme ) %>%
+tiff_split("images_v19/DimPlot_All_splitv2_predicted.tiff")
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="predicted.celltype.l1", split.by = "Treatment")+guides(colour=guide_legend(override.aes=list(size=18))) + umap_theme) %>% 
+tiff_split("images_v19/DimPlot_All_splitv3_predicted.tiff")
+
+
+
+```
+
+
+
+```{r}
+# Collapsing the cell types into fewer groups (for visual display)
+
+sObj_integAll@meta.data <- sObj_integAll@meta.data %>% mutate(
+  predicted.celltype.l2.collapse = case_when(
+            predicted.celltype.l2 == "B intermediate" ~ "Other",
+            predicted.celltype.l2 == "B memory" ~ "Other", 
+            predicted.celltype.l2 == "CD14 Mono" ~ "Other",
+            predicted.celltype.l2 == "HSPC" ~ "Other",
+            predicted.celltype.l2 == "pDC" ~ "Other",
+            predicted.celltype.l2 == "Plasmablast" ~ "Other",
+            predicted.celltype.l2 == "B naive" ~ "Other", 
+
+            predicted.celltype.l2 == "Treg" ~ "T Regulatory",
+            predicted.celltype.l2 == "dnT" ~ "dnT",
+            predicted.celltype.l2 == "MAIT" ~ "MAIT",
+            predicted.celltype.l2 == "CD4 CTL" ~ "T Cytotoxic",
+            predicted.celltype.l2 == "cDC2" ~ "cDC2-like T Activated",
+
+            predicted.celltype.l2 == "CD4 TEM" ~ "T Effector Memory",
+            predicted.celltype.l2 == "CD8 TEM" ~ "T Effector Memory",
+            predicted.celltype.l2 == "CD4 Proliferating" ~ "T Proliferating",
+            predicted.celltype.l2 == "CD8 Proliferating" ~ "T Proliferating",
+            predicted.celltype.l2 == "NK" ~ "NK-like T Proliferating",
+            predicted.celltype.l2 == "NK Proliferating" ~ "NK-like T Proliferating",
+            predicted.celltype.l2 == "CD4 Naive" ~ "T Naive",
+            predicted.celltype.l2 == "CD8 Naive" ~ "T Naive",
+            predicted.celltype.l2 == "CD4 TCM" ~ "T Central Memory",
+            predicted.celltype.l2 == "CD8 TCM" ~ "T Central Memory",
+              TRUE ~ "ERROR"))
+
+
+
+sObj_integAll$predicted.celltype.l2.collapse <- sObj_integAll$predicted.celltype.l2.collapse %>% factor(levels=c("T Naive", "T Proliferating", "T Central Memory", "T Effector Memory", "T Cytotoxic","cDC2-like T Activated","dnT","T Regulatory", "MAIT", "NK-like T Proliferating", "Other"))
+
+
+colors_forSeurat_collapse2 = palette36.colors(n=sObj_integAll$predicted.celltype.l2.collapse %>% unique() %>% length())%>% setNames(NULL) # Taking as many colors as there are cell types. Setting names to NULL, otherwise does not work. 
+
+
+colors_forSeurat_collapse2[1] <- "#7B3F00"
+temp <- colors_forSeurat_collapse2[2]
+colors_forSeurat_collapse2[2] <- colors_forSeurat_collapse2[3]
+colors_forSeurat_collapse2[3] <- colors_forSeurat_collapse2[5]
+colors_forSeurat_collapse2[5] <- "yellow"
+rm(temp)
+
+temp <- colors_forSeurat_collapse2[7] 
+colors_forSeurat_collapse2[7]  <-  colors_forSeurat_collapse2[10] 
+colors_forSeurat_collapse2[10] <- temp
+rm(temp)
+
+
+
+
+
+colors_forSeurat_collapse2[11] <- "#D9D9D9"
+
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="predicted.celltype.l2.collapse", split.by="orig.ident.changeOrder", cols = colors_forSeurat_collapse2) + ggtitle("Predicted celltype level 2 : Collapsed")+guides(colour=guide_legend(override.aes=list(size=18))) + umap_theme) %>% 
+tiff_split("images_v19/DimPlot_All_split_predicted_l2_collapse.tiff")
+
+
+
+
+
+# The colors used here are the same colors as the colors for the collapsed above. Only thing has changed is the MM only subset
+(sObj_integAll %>% subset(health == "MM") %>% DimPlot(pt.size = 1.5,group.by="predicted.celltype.l2.collapse", split.by="Treatment", cols = colors_forSeurat_collapse2) + ggtitle("Predicted celltype level 2 : Collapsed")+guides(colour=guide_legend(override.aes=list(size=18))) + umap_theme) %>% 
+tiff_split("images_v19/DimPlot_All_split_predicted_l2_collapse_MMonly.tiff")
+
+```
+
+
+
+
+```{r}
+# Make the colors BEFORE collapse resemble the colors AFTER collapse
+
+colors_forSeurat_nocollapse <- rep(NA, times=sObj_integAll$predicted.celltype.l2 %>% unique() %>% length())  %>% setNames(sObj_integAll$predicted.celltype.l2 %>% unique())
+
+colors_forSeurat_nocollapse["B intermediate"] <- "#EEEEEE"
+colors_forSeurat_nocollapse["B memory"] <- "#CCCCCC"
+colors_forSeurat_nocollapse["CD14 Mono"] <- "#AAAAAA"
+colors_forSeurat_nocollapse["HSPC"] <- "#888888"
+colors_forSeurat_nocollapse["pDC"] <- "#DDDDCC"
+colors_forSeurat_nocollapse ["Plasmablast"] <- "#777777"
+colors_forSeurat_nocollapse["B naive"] <- "#555555"
+
+
+colors_forSeurat_nocollapse["Treg"] <- "#B00068"
+colors_forSeurat_nocollapse["dnT"] <- "#90AD1C"
+colors_forSeurat_nocollapse["MAIT"]<- "#1CFFCE"
+colors_forSeurat_nocollapse["cDC2"] <- "#3283FE"
+
+colors_forSeurat_nocollapse  ["CD4 TEM"] <- "#FE00FA"
+colors_forSeurat_nocollapse  ["CD8 TEM"] <- "#FE88FA"
+colors_forSeurat_nocollapse  ["CD4 Proliferating"] <- "#F6222E"
+colors_forSeurat_nocollapse  ["CD8 Proliferating"] <- "#FF999F"
+colors_forSeurat_nocollapse ["CD4 CTL"] <- "#FEFF16"
+colors_forSeurat_nocollapse  ["NK"] <- "darkorange"
+colors_forSeurat_nocollapse  ["NK Proliferating"] <- "orange"
+colors_forSeurat_nocollapse  ["CD4 Naive"] <- "#D2A679"
+colors_forSeurat_nocollapse  ["CD8 Naive"] <- "#7B3F00"
+colors_forSeurat_nocollapse  ["CD4 TCM"] <- "#16FF32"
+colors_forSeurat_nocollapse["CD8 TCM"] <- "#99FF32"
+
+            
+
+sObj_integAll$predicted.celltype.l2.changeorder <- sObj_integAll$predicted.celltype.l2 %>% factor(levels=c("CD4 Naive","CD8 Naive", "CD4 Proliferating", "CD8 Proliferating", "CD4 TCM", "CD8 TCM","CD4 TEM", "CD8 TEM", "CD4 CTL","cDC2","dnT","Treg", "MAIT", "NK", "NK Proliferating", "B naive", "B intermediate", "B memory", "CD14 Mono", "HSPC", "pDC","Plasmablast"))
+
+
+# Create a table of the cell types used by cluster
+(table9 <- myPropTable_2var(sObj_integAll$predicted.celltype.l2.changeorder, sObj_integAll$seurat_clusters, margin=2))
+table9 %>% write.table("images_v19/table9_predicted_level2_byCluster.csv", col.names=NA, sep="\t", quote=F)
+
+
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="predicted.celltype.l2.changeorder", split.by="orig.ident.changeOrder") + ggtitle("Predicted cell type level 2")+ scale_color_manual(values=colors_forSeurat_nocollapse) + guides(colour=guide_legend(override.aes=list(size=18))) + umap_theme ) %>%
+tiff_split("images_v19/DimPlot_All_split_predicted_l2.tiff")
+```
+
+
+```{r}
+# Here, use RANDOM colors for collapse (but in the same order)
+
+(sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="predicted.celltype.l2.changeorder", split.by="orig.ident.changeOrder", cols=palette36.colors(n=sObj_integAll$predicted.celltype.l2.changeorder %>% unique() %>% length())%>% setNames(NULL)) + ggtitle("Predicted cell type level 2 (Random colors)")+ guides(colour=guide_legend(override.aes=list(size=18))) + umap_theme ) %>%
+tiff_split("images_v19/DimPlot_All_split_predicted_l2_randcol.tiff")
+
+```
+
+
+
+```{r}
+
+sObj_integAll$CD4CD8 %>% table()
+
+
+
+table(sObj_integAll$CD4CD8 , sObj_integAll$CAR)
+
+```
+
+## Show clusters with CD4CD8
+
+```{r}
+
+ sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="seurat_clusters", split.by="CD4CD8", label=T) + umap_theme
+
+ sObj_integAll %>% DimPlot(pt.size = 0.5,group.by="orig.ident.changeOrder",  label=T) + umap_theme
+
+```
+
+# Subset for CAR plus
+
+```{r}
+ sObj_integAll_CARplus<-sObj_integAll %>% subset(subset=CAR==TRUE)
+# rm(sObj_integAll)
+gc()
+
+DefaultAssay(sObj_integAll_CARplus) <- "SCT"
+```
+
+## Calculate num of cells per sample
+
+```{r}
+(table10 <- table(sObj_integAll_CARplus$orig.ident))
+table10 %>% write.table("images_v19/table10_Cells_inCARplus.csv", col.names=NA, sep="\t", quote=F)
+```
+
+## Add module scores based on CARplus
+
+```{r}
+
+for(j in names(geneSets)) {
+      set.seed(123)
+      sObj_integAll_CARplus <- sObj_integAll_CARplus %>% AddModuleScore(features=geneSets[j], assay="SCT", name=j, search = T )
+      }
+
+
+# sObj_integAll_CARplus %>% saveRDS("sObj_integratedAll_CARplus_")
+```
+
+## Plot marker dot plots
+
+```{r DotPlot with separation by CAR and orig.ident}
+text_size = 13
+for( j in markersList_v6 %>% names() ) {
+
+  
+  # 15 is the maximum number of markers in a graph
+
+    width = 8.5 * sqrt( length(markersList_v6[[j]]) / 15 ) %>% round(1)
+  
+  
+    tiff(paste0("images_v19/Dotplot_",j %>% make_file_name(), "_CARPlusOnly.tiff"),width=width,  height=4, unit="in",res=300, compression="lzw")
+
+
+  
+             mydotplot <- sObj_integAll_CARplus %>% DotPlot( features = markersList_v6[[j]], group.by="orig.ident", dot.scale = 7, scale=TRUE, scale.by="size") + theme(axis.text.x = element_text(angle = 90,vjust=0.5,size=text_size),axis.text.y = element_text(size=text_size), title=element_text(size=text_size+2.5))+labs(x="Genes",y="Assay")+ scale_y_discrete(expand = expansion(mult = c(0.05, 0.15)))    + ggtitle(j) + scale_color_gradient2(low = "navy",mid = "lightgrey", high = "red2", midpoint = 0,space = "Lab",limits = c(-1.5, 1.5), oob = scales::squish) + ylab("") +xlab("") +scale_size_area(max_size = 12, limits=c(0,100))+scale_y_discrete(limits = c( "MM1_CD62L","MM2_CD62L", "HD_CD62L","MM1_TM",  "MM2_TM", "HD_TM") %>%rev())# %>% #+ xlab("") +coord_fixed(ylim = c(0.8,2.1))
+  
+  # Draw with legend, get legend, then remove it.  Legend should be the same for all plots
+  dotplot_legend <- (mydotplot +
+  guides(color = guide_colorbar(title = "Scaled \nAverage Expression")))%>%get_legend()
+  
+             
+  mydotplot <- mydotplot + theme(legend.position = "none")
+  
+             # Save the data as tables             
+             mydat <- mydotplot$data   # %>% mutate(pct.exp = pct.exp %>% round(2), avg.exp = avg.exp %>% round(3))
+ 
+             
+                          mydat_ordered <- mydat %>% select(id, pct.exp,avg.exp.scaled, features.plot) %>% pivot_wider(names_from=c("id"), values_from = c("pct.exp", "avg.exp.scaled"))
+                 
+                                                                                           
+             
+             
+             
+             mydat_ordered %>% write.table(paste0("images_v19/Dotplot_",j%>% make_file_name(), "CARPlusOnly.csv"), row.names = F, sep="\t", quote=F)
+             
+           
+             mydotplot %>% print()
+
+      
+  
+  dev.off()
+
+}
+
+
+  tiff(paste0("images_v19/Dotplot_LEGEND_CARPlusOnly.tiff"),width=2,  height=4, unit="in",res=300, compression="lzw")
+  grid.newpage()
+  grid.draw(dotplot_legend)
+  dev.off()
+
+
+```
+
+# Dot plot on CD8 only
+```{r DotPlot on CD8 only subset}
+sObj_integAll_CARplus_CD8only <- sObj_integAll_CARplus %>% subset(subset=CD4CD8 == "CD8")
+
+text_size = 13
+for( j in markersList_v6 %>% names() ) {
+
+  
+  # 15 is the maximum number of markers in a graph
+  #  Rhw moew markers there are the wider should the plot be. 
+  width = 8.5 * sqrt( length(markersList_v6[[j]]) / 15 ) %>% round(1)
+  
+  
+    tiff(paste0("images_v19/Dotplot_",j %>% make_file_name(), "_CARPlusOnly_CD8only.tiff"),width=width,  height=4, unit="in",res=300, compression="lzw")
+
+
+  
+             mydotplot <- sObj_integAll_CARplus_CD8only %>% DotPlot( features = markersList_v6[[j]], group.by="orig.ident", dot.scale = 7, scale=TRUE, scale.by="size") + theme(axis.text.x = element_text(angle = 90,vjust=0.5,size=text_size),axis.text.y = element_text(size=text_size), title=element_text(size=text_size+2.5))+labs(x="Genes",y="Assay")+ scale_y_discrete(expand = expansion(mult = c(0.05, 0.15)))    + ggtitle(j) + scale_color_gradient2(low = "navy",mid = "lightgrey", high = "red2", midpoint = 0,space = "Lab",limits = c(-1.5, 1.5), oob = scales::squish) + ylab("") +xlab("") +scale_size_area(max_size = 12, limits=c(0,100))+scale_y_discrete(limits = c( "MM1_CD62L","MM2_CD62L", "HD_CD62L","MM1_TM",  "MM2_TM", "HD_TM") %>%rev())
+  
+  # Draw with legend, get legend, then remove it, and plot at the end as a separate image (legend should be the same for all plots).
+  dotplot_legend <- (mydotplot +
+  guides(color = guide_colorbar(title = "Scaled \nAverage Expression")))%>%get_legend()
+  
+             
+  mydotplot <- mydotplot + theme(legend.position = "none")
+  
+             # Save the data as tables             
+             mydat <- mydotplot$data   # %>% mutate(pct.exp = pct.exp %>% round(2), avg.exp = avg.exp %>% round(3))
+ 
+             
+                          mydat_ordered <- mydat %>% select(id, pct.exp,avg.exp.scaled, features.plot) %>% pivot_wider(names_from=c("id"), values_from = c("pct.exp", "avg.exp.scaled"))
+                 
+                                                                                           
+             
+             
+             
+             mydat_ordered %>% write.table(paste0("images_v19/Dotplot_",j%>% make_file_name(), "CARPlusOnly_CD8only.csv"), row.names = F, sep="\t", quote=F)
+             
+           
+             mydotplot %>% print()
+
+      
+  
+  dev.off()
+
+}
+
+
+  tiff(paste0("images_v19/Dotplot_LEGEND_CARPlusOnly_CD8only.tiff"),width=2,  height=4, unit="in",res=300, compression="lzw")
+  grid.newpage()
+  grid.draw(dotplot_legend)
+  dev.off()
+
+
+```
+
+
+
+
+# Plot MM only
+
+```{r}
+
+sObj_integAll_CARplus_MMonly <- sObj_integAll_CARplus %>% subset(subset=health=="MM")
+sObj_integAll_CARplus_HealthyOnly <- sObj_integAll_CARplus %>% subset(subset=health=="Healthy")
+```
+
+
+## Plot markers violin plots
+```{r}
+
+  
+
+    # Split the marker list into a limited number per page
+    markers_per_pageB <- 6
+    
+    split_markers <- additionalMarkers %>% split( (1:length(additionalMarkers)/markers_per_pageB) %>% ceiling() )  
+    
+    
+    for( i in 1:length(split_markers)) {
+      
+      one_set_of_markers <- split_markers[[i]]
+           
+              plots_to_combine <- 
+                
+              one_set_of_markers %>%   lapply(function(one_marker) {
+                
+                
+                (sObj_integAll_CARplus_MMonly %>% VlnPlot(features=one_marker, group.by="Treatment", pt.size = 0, cols = VIOLIN_COLS) +  NoLegend() + stat_summary( fun=median, geom="point", size=2, color="black", show.legend = F)) # + geom_boxplot(outliers=FALSE, width=0.3)) 
+  
+              })
+
+
+  if(length(one_set_of_markers) %% markers_per_pageB != 0)
+          plots_to_combine <- plots_to_combine %>% append( list(plot_spacer()) %>% rep(markers_per_pageB - (length(one_set_of_markers) %% markers_per_pageB)) )
+
+              
+              tiff(glue("images_v19/VlnPlot_Markers_CARplusOnly_MMonly_{i}.tiff"), compression="lzw",width=0.75*960, height=1.25*480)
+              plots_to_combine %>% wrap_plots() %>% print()
+              dev.off()
+
+              } 
+  
+      
+      
+
+
+
+
+
+
+```
+
+
+```{r}
+
+## Plot VlnPlots as TIFF(two MM samples combined into one AND a healthy non-split sample)  - a version with different colors... 
+
+
+
+text_size = 26
+set.seed(123)
+
+
+    for( one_marker in (names(geneSets) %>% rev())) {
+
+
+            one_marker_1 <- one_marker %>% paste0(1)
+
+            one_marker_dat_mm <-sObj_integAll_CARplus_MMonly %>% FetchData(vars=c(one_marker_1, "Treatment", "Donor"))
+
+
+
+            mm_plot <- (sObj_integAll_CARplus_MMonly %>% VlnPlot(features=one_marker_1, group.by="Treatment", split.by="Donor",pt.size = 0, split.plot=TRUE) +xlab("") + scale_y_continuous(limits = c(-0.25,+0.4))  + theme(plot.title = element_blank(), legend.position="right", legend.title=element_blank()))+  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=text_size),axis.text.y = element_text(size=text_size+4), legend.text   =element_text(size=text_size),title=element_text(size=text_size)) + stat_summary( data=one_marker_dat_mm,inherit.aes = FALSE,aes(x=Treatment, y=.data[[one_marker_1]], group=Donor, fill=Donor),shape=95,fun=median,size=4, stroke=3,show.legend=F,  color="black",position=position_dodge(width=0.5) ) + ylab("Gene Set Score")
+
+
+            COLS_MIXED <- c("CD62L MM1"=colorspace::lighten(VIOLIN_COLS[["CD62L"]], amount = 0.5), "CD62L MM2"= VIOLIN_COLS[["CD62L"]], "TM MM1"= colorspace::lighten(VIOLIN_COLS[["TM"]] , amount = 0.5), "TM MM2"= VIOLIN_COLS[["TM"]])
+           
+                        
+            mm_plot$data$fill_group <- paste(mm_plot$data$ident, mm_plot$data$split)
+            
+         
+
+
+              mm_plot <- mm_plot + aes(fill=fill_group)+  scale_fill_manual( values =COLS_MIXED)
+            
+
+
+            one_marker_dat_healthy <-sObj_integAll_CARplus_HealthyOnly %>% FetchData(vars=c(one_marker_1, "Treatment", "Donor")) # used for stats_summary
+
+            
+            
+            # Combined so that the labels have both the treatment and the donors specified
+        sObj_integAll_CARplus_HealthyOnly$Treatment_Donor <- paste(sObj_integAll_CARplus_HealthyOnly$Treatment,sObj_integAll_CARplus_HealthyOnly$Donor)
+            
+            
+            # Omit y-axis from healthy plot for better combination
+            healthy_plot <- (sObj_integAll_CARplus_HealthyOnly %>% VlnPlot(features=one_marker_1, group.by="Treatment",pt.size = 0) )+xlab("") + scale_y_continuous(limits = c(-0.25,+0.4))  + theme(plot.title = element_blank()) + theme(axis.text.y = element_blank(), axis.title.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y=element_blank(), legend.title=element_blank(), axis.text.x = element_text(size = text_size),legend.text  =element_text(size=text_size)) + stat_summary(data=one_marker_dat_healthy,inherit.aes = FALSE,aes(x=Treatment, y=.data[[one_marker_1]]),fun=median,  shape=95,size=6,  show.legend=F, color="black", stroke=3 )+ylab("")+scale_fill_manual(values=c("TM"="lightgrey","CD62L"="lightgrey"),labels=c( "TM"="TM HD", "CD62L"="CD62L HD")) 
+
+
+
+
+
+             mm_and_healthy_legend <- wrap_plots(get_legend(mm_plot) , get_legend(healthy_plot), ncol=1, heights = unit(c(1, 3.5), c('cm', 'cm')))  # Is the same  for all plots
+
+             mm_and_healthy <-     (mm_plot + theme(legend.position = "none")) | (healthy_plot+ theme(legend.position="none") )
+
+
+            page <- wrap_elements(mm_and_healthy + plot_annotation(title=one_marker,theme = theme(plot.title = element_text(hjust = 0.5, size=text_size+4, face = "bold") )) + plot_layout(guide="collect"))
+
+            page
+
+
+
+    tiff(paste0("images_v19/geneSets_VlnPlots_", one_marker %>% make_file_name(), "_CARplusONLY_splitMM.tiff"),width=0.85*960, units="px", compression = "lzw")
+
+
+    page %>% print()
+
+    dev.off()
+
+     }
+
+
+
+    tiff(paste0("images_v19/geneSets_VlnPlots_LEGEND_CARplusONLY_splitMM.tiff"),width=0.2*960, units="px", compression = "lzw")
+    mm_and_healthy_legend# %>% grid.draw()
+    dev.off()
+
+    
+
+```
+
+
+
+
+```{r}
+
+# Helper function for drawing a heatmap
+
+myMatHeatMap <- function(fdata,top=50,colrot=60,uthr=3,lthr=-3,colors=colorRampPalette(rev(brewer.pal(n = 5, name = "RdBu")))(100),samples=NULL,names=NULL,rowscale=TRUE,allscale=TRUE,logT=T,breaks=seq(lthr,uthr,(uthr-lthr)/100),rowanno=NULL,colanno=NULL,anno_cols=NULL,cluster_rows=F,cluster_cols=F,file="tempheatmap",colsfactor=1,rowsfactor=1,params=NULL, ...) {
+
+# fdata- the data; top- the number of genes to be shown together with their names (on a separate plot);
+# uthr- the upper threshold of the zscore; lthr- the lower threshold of the z-score
+# colors- color palette; samples- the specific samples to be selected. 
+# names- ?? Goes to HMVIEW, which goes to VNAMES. Seems to annotate specific genes, when using all genes (not top).
+# logT- seems that when logT=T, allscale graphs (only) are by default first log-transformed and only then z-score is calculated
+# colanno- an annotation for each sample. By 'annotation' not the name of the sample is meant, but rather the color bar above the sample (in our case it indicates to which condition it belongs). Set by DE_Graphics (and is simply the condition column for the samples). 
+# rowanno -  An annotation for each gene. Left null in our default case, but one could use it to divide genes into classes (e.g. pathways) and annotate the heatmap accordingly. 
+# cluster_rows- whether to the rows (rclust); cluster_cols- whether to cluster also the columns (blucst when both are true)
+# hmparam- hmparam is passed to myMatMakeDEFigs. It is a way to override the default parameters of myMatHeatmap without overloading myMatMakeDEFigs with lots of parameters belonging also to myMatScatterPlot and others. Whatever parameters (of identical names to the ones above) are set in hmparam, they override the default parameters.
+# "colrot", set the rotation angle of the column labels (default 60, as the fixed value we had before).
+# "showcolnames", determines when to draw column labels. Can get one of "auto" (default, will show labels up to 30 columns); "yes" (will always show labels); or "no" (will not show labels).
+# "colsfactor", set the size of column labels font, relative to the default calculation (default is 1, values between 0 and 1 will decrease font size, values above 1 will increase).
+# "rowsfactor",  set the size of row labels font, relative to the default calculation (default is 1, values between 0 and 1 will decrease font size, values above 1 will increase).
+#All of these new parameters can be inserted into the "params" list that is passed to the general drawing function "myMatMakeDEFigs" in RNA-Seq scripts.
+
+        fdata$HMView <- sapply(as.vector(fdata$Symbol), function(x) ifelse(x %in% names, x, ""))
+        if(!is.null(samples)) {
+                sigmat <- as.matrix(fdata[,samples])
+                sigmattop <- as.matrix(head(fdata[,samples],top))
+        } else {
+                sigmat <- as.matrix(fdata[,unlist(lapply(fdata,is.numeric))])
+                sigmattop <- as.matrix(head(fdata[,unlist(lapply(fdata,is.numeric))],top))
+        }
+
+        if(cluster_rows) {
+                toclustrow = nrow(sigmat)>2
+                toclustrowtop = nrow(sigmattop)>2
+        } else {
+                toclustrow = F
+                toclustrowtop = F
+        }
+        if(cluster_cols) {
+                toclustcol = ncol(sigmat)>2
+        } else {
+                toclustcol = F
+        }
+        snumw = 60*ncol(sigmat)
+        gnumh = 40*nrow(sigmat)
+        w = min(3600,snumw+2400)
+        h = min(3600,gnumh+1600)
+        htop = min(3600,40*top+1600)
+        cellw = ifelse(w==3600,NA,((w-2400)/5.5)/ncol(sigmat))
+        cellh = ifelse(h==3600,NA,((h-1600)/6.6)/nrow(sigmat))
+        cellhtop = ifelse(htop==3600,NA,((htop-1600)/6.6)/top)
+        fsizecol = ifelse(w==3600,colsfactor*8,colsfactor*cellw*0.6)
+        fsizerow = ifelse(h==3600,rowsfactor*5.5,rowsfactor*cellh*0.75)
+        fsizerowtop = ifelse(htop==3600,rowsfactor*5.5,rowsfactor*cellhtop*0.75)
+		    showcols = TRUE
+		    # orig_draw_colnames <<- pheatmap:::draw_colnames
+		 
+	
+        if(nrow(sigmat) > 0) {
+                if(rowscale) {
+                        sigmats <- t(scale(t(sigmat)))
+                        sigmattops <- t(scale(t(sigmattop)))
+                        fname <- paste0(file,"_rowscale")
+                }
+                else {
+                        sigmats <- sigmat
+                        sigmattops <- sigmattop
+                        fname <- file
+                }
+                sigmats[is.nan(sigmats)] = 0
+                sigmattops[is.nan(sigmattops)] = 0
+                sigmats[sigmats > uthr] = uthr
+                sigmattops[sigmattops > uthr] = uthr
+                sigmats[sigmats < lthr] = lthr
+                sigmattops[sigmattops < lthr] = lthr
+
+                sigmats <- as.data.frame(sigmats)
+                sigmattops <- as.data.frame(sigmattops)
+                sigmats$VNAMES <- fdata$HMView
+                sigmattops$VNAMES <- head(fdata$HMView,top)
+                sigmats$SYMBOL <- fdata$Symbol
+                sigmattops$SYMBOL <- head(fdata$Symbol,top)
+
+                nrs <- nrow(sigmats)
+                if(nrs <= top) {
+                        png(paste0(fname,".png"), w, h, res=600)
+                        pheatmap(subset(sigmats,select=-c(VNAMES,SYMBOL)), color=colors, breaks=breaks, cluster_rows=toclustrow, cluster_cols=toclustcol, cellwidth=cellw, cellheight=cellh, show_colnames=showcols, labels_row=sigmats$SYMBOL, annotation_row=rowanno, annotation_col=colanno, annotation_colors=anno_cols, annotation_names_row=F, annotation_names_col=F, fontsize=8, fontsize_row=fsizerow, fontsize_col=fsizecol, ...)
+                        dev.off()
+                } 
+        }
+
+	# assignInNamespace(x="draw_colnames", value="orig_draw_colnames", ns=asNamespace("pheatmap"))
+}
+```
+
+
+
+
+# Heatmap draw
+```{r} 
+
+
+
+  columns_anno <- data.frame( Treatment=c("CD62L", "CD62L", "CD62L", "TM", "TM", "TM")) %>% setRowNames(c("MM1_CD62L", "MM2_CD62L", "HD_CD62L", "MM1_TM", "MM2_TM", "HD_TM"))
+
+
+ columns_color <- list(Treatment = c("#f0a000", "#0000c3") %>% setNames(c("CD62L", "TM")))
+
+
+
+  
+ 
+#sct_CD4 variable is used because we need the CD4 not from the metadata, but from the assay.
+ 
+ markersToPlot <- c(markersList_v6 %>% unlist() %>% setNames(NULL) , "sct_CD4", "CD8A", "CD8B")
+
+ 
+ markersToPlot <- markersToPlot %>% unique() # LEF1 appears in both CD8 subset and T-cell memory associated
+                    
+  
+  mydotplot <- sObj_integAll_CARplus %>% DotPlot(features = markersToPlot, group.by ="orig.ident", scale=T, cols=c("blue", "red")) +scale_color_gradient2(low = "navy",mid = "grey", high = "red2", midpoint = 0,space = "Lab")+ theme(axis.text.x = element_text(angle = 45, hjust = 1,size=10),axis.text.y = element_text(size=8))+labs(x="Genes",y="Assay")
+  
+  data_for_heatmap <- mydotplot$data %>% mutate(Symbol=features.plot, id=as.character(id)) %>% select(Symbol, avg.exp.scaled, id) %>% group_split(id) 
+  
+  # Get the id of the sample from the object and name the object accordingly
+  data_for_heatmap <- data_for_heatmap %>% lapply(function(j)  {
+                                              colnames(j)[2] <- j$id[1]
+                                              j <- j %>% select(-id)
+                                              j
+   })
+    
+
+  # Combine into one object                                            
+  data_for_heatmap_combined <- data_for_heatmap %>%   Reduce(f = function(x,y) merge(x,y,by="Symbol", all=T)) %>% relocate(ends_with("TM")) %>% relocate(Symbol)
+  
+  # For aesthetics' sake, CD4 should be called CD4 not sct_CD4 (even though this is the key used)
+  data_for_heatmap_combined$Symbol <- data_for_heatmap_combined$Symbol %>%    as.character() 
+  data_for_heatmap_combined$Symbol[data_for_heatmap_combined$Symbol == "sct_CD4"] <- "CD4"  # Rename sct_CD4 from the assay to be called CD4 (for aesthetics' sake)
+  data_for_heatmap_combined$Symbol <- data_for_heatmap_combined$Symbol %>% factor()
+  # Arrange according to original gene order, not alphabetic
+  rownames(data_for_heatmap_combined) <- data_for_heatmap_combined$Symbol
+  
+  
+  # Set desired order of columns
+  data_for_heatmap_combined <- data_for_heatmap_combined[,c("Symbol", rownames(columns_anno))]
+  
+  
+  data_for_heatmap_combined %>%   myMatHeatMap(allscale = F, rowscale = F, uthr=1.5, lthr = -1.5, cluster_rows=T, cluster_cols=T, treeheight_row=9, colanno=columns_anno, anno_cols = columns_color,  top=Inf,  file = "images_v19/heatmap_allMarkers" )
+
+
+
+```
+
+
+
+```{r}
+cat("All cells")
+sObj_integAll@meta.data %>% filter(Treatment == "CD62L") %>% .$
+  predicted.celltype.l2.collapse %>% table() %>% prop.table() %>% round(2)
+sObj_integAll@meta.data %>% filter(Treatment == "TM") %>% .$predicted.celltype.l2.collapse %>% table() %>% prop.table() %>% round(2)
+```
+
+```{r}
+cat("CAR plus")
+sObj_integAll_CARplus@meta.data %>% filter(Treatment == "CD62L") %>% .$predicted.celltype.l2.collapse %>% table() %>% prop.table() %>% round(2)
+sObj_integAll_CARplus@meta.data %>% filter(Treatment == "TM") %>% .$predicted.celltype.l2.collapse %>% table() %>% prop.table() %>% round(2)
+
+```
+
+
+```{r}
+sObj_integAll_CARplus %>% qsave("Robjects/sObj_integratedAll_CARplus.qs")
+
+```
+
+
+
+
+```{r}
+sink("sessionInfo.log")
+date()
+sessionInfo()
+sink()
+
+date()
+sessionInfo()
+```
+
