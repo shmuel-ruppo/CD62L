@@ -14,4 +14,4 @@ Pseudo-bulk and DESeq2:
 5. Run the DESeq2 analysis with `FDR_0.1/DESeq2_DE.R`
 6. The resulting `.rnk` file can be used for GSEA analysis
 
-For the list packagesused and their versions see [session info](sessionInfo.md)
+For the list packages used and their versions see [session info](sessionInfo.md)
