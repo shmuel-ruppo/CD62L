@@ -1,7 +1,5 @@
 # CD62L
 
-Raw data (CellRanger output) is available at https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE333279
-
 Main:
 
 1. Create a Seurat object with per-sample information from CellRanger output with `createSeuratObjects.Rmd`. This saves an intermediary object in `Robjects/`.
